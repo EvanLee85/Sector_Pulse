@@ -1,0 +1,38 @@
+version: "1.03"
+project: "SectorPulse"
+
+# —— 运行环境（开发期：先写死用 dev；后续可用 env 变量切换）——
+environment: "dev"              # dev | prod
+
+# —— 时区与执行窗口（只在这些时间点触发执行分支）——
+execution:
+  tz: "Asia/Shanghai"
+  windows: ["10:00", "14:00"]        # 仅在这些时点进入交易分支
+  tail_session:
+    time: "14:45"
+    allow_buy: false
+    allow_sell: true                 # 尾盘仅卖（可选）
+
+
+# —— 数据源（开发期把频率放宽，减少限流/报错）——
+data_sources:
+  sectors:
+    source: "akshare"
+    refresh_interval_sec: 1800     # 30 分钟（开发期）
+  stocks:
+    source: "akshare"
+    universe: "A_STOCK"
+    exclude_st: true
+    refresh_interval_sec: 1800
+
+# —— 调度与交易日历 —— 
+scheduler:
+  coalesce: true
+  misfire_grace_time_sec: 120
+  max_instances: 1
+  calendar_fail_policy: "fail_open"      # fail_open | fail_closed
+  calendar_cache_stale_days: 7
+calendar:
+  market: "SSE_SZSE"
+  holidays_source: "local_table"
+  trading_days_source: "exchange_calendars"

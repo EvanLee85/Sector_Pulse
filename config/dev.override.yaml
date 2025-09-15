@@ -1,0 +1,16 @@
+# 仅用于 dev 环境覆盖
+environment: "dev"
+
+emotion_gate:
+  limit_up_count_min: 10
+  limitup_down_ratio_min: 0.50
+  turnover_concentration_max: 0.45   # 开发期放宽
+  vol_percentile_max: 0.85           # 开发期放宽
+  sh_ma20_filter: true
+
+position_management:
+  stop_loss: -0.10                    # 开发期减少止损干扰
+
+data_sources:
+  sectors: { refresh_interval_sec: 1800 }
+  stocks:  { refresh_interval_sec: 1800 }

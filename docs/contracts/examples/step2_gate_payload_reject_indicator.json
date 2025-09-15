@@ -1,0 +1,44 @@
+{
+  "window": "14:00",
+  "tz": "Asia/Shanghai",
+  "passed": false,
+  "reasons": ["vol_percentile: 0.93 vs 0.85 (<=)"],
+  "calendar": {
+    "source": "akshare",
+    "degraded": false,
+    "staleness_days": 0
+  },
+  "sources": {
+    "limit_up_count":               {"api": "stock_zt_pool_em",        "fetched_at": "2025-09-13T14:00:02+08:00"},
+    "limit_down_count":             {"api": "stock_zt_pool_dtgc_em",   "fetched_at": "2025-09-13T14:00:02+08:00"},
+    "limitup_down_ratio":           {"api": "derived(zt_pool+dtgc)",   "fetched_at": "2025-09-13T14:00:02+08:00"},
+    "turnover_concentration_top20": {"api": "stock_zh_a_spot_em",      "fetched_at": "2025-09-13T14:00:03+08:00"},
+    "hs300_vol_30d_annualized":     {"api": "stock_zh_index_daily_em", "fetched_at": "2025-09-12T16:10:00+08:00"},
+    "vol_percentile":               {"api": "stock_zh_index_daily_em", "fetched_at": "2025-09-12T16:10:00+08:00"},
+    "sh_above_ma20":                {"api": "spot(daily_MA20+index)",  "fetched_at": "2025-09-13T14:00:03+08:00"},
+    "margin_net_repay_yi_prev":     {"api": "SSE+SZSE_margin",         "fetched_at": "2025-09-12T18:30:00+08:00"},
+    "intraday_missing":             {"api": "derived(health_check)",   "fetched_at": "2025-09-13T14:00:03+08:00"},
+    "calendar_degraded":            {"api": "derived(calendar_status)","fetched_at": "2025-09-13T14:00:03+08:00"}
+  },
+  "indicators": {
+    "limit_up_count": 70,
+    "limit_down_count": 10,
+    "limitup_down_ratio": 7.0,
+    "turnover_concentration_top20": 0.36,
+    "hs300_vol_30d_annualized": 0.25,
+    "vol_percentile": 0.93,
+    "sh_above_ma20": true,
+    "margin_net_repay_yi_prev": -11.8,
+    "intraday_missing": false,
+    "calendar_degraded": false
+  },
+  "thresholds": {
+    "emotion_gate.limit_up_count_min": 60,
+    "emotion_gate.limitup_down_ratio_min": 0.5,
+    "emotion_gate.turnover_concentration_max": 0.4,
+    "emotion_gate.vol_percentile_max": 0.85,
+    "emotion_gate.ma20_required": true
+  },
+  "version": "step2-contract-v1.1",
+  "calc_at": "2025-09-13T14:00:04+08:00"
+}
