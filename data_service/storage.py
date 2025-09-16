@@ -7,10 +7,11 @@ import random
 import inspect
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable, Dict, Hashable, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Hashable, Mapping, Optional, Tuple, List, Sequence
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
+from pathlib import Path
+import json
 
 # -------- Time / TZ --------
 _SH_TZ = ZoneInfo("Asia/Shanghai")
@@ -157,4 +158,173 @@ __all__ = [
     "now_shanghai",
     "cached",
     "call_with_retry",
+]
+
+
+# =========================
+# 下面为 Step3（Kill-Switch / Restart）所需追加的最小实现
+# - 事件写入：优先 DB → 降级 JSONL（events/altflow_events.jsonl）
+# - 系统状态：position_cap / sleeping 幂等落地（降级 runtime_state.json）
+# - 查询能力：query_events / get_monthly_drawdown（占位）
+# =========================
+
+# --- 可选：对接 ORM（若不可用则自动降级） ---
+try:
+    # 你的 ORM 若未提供下列符号，将自动走 JSONL 降级
+    from models.database import get_session  # type: ignore
+    from models.database import EventLog    # type: ignore
+except Exception:
+    get_session = None  # type: ignore
+    EventLog = None     # type: ignore
+
+_EVENTS_DIR = Path("events")
+_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+_EVENTS_JSONL = _EVENTS_DIR / "altflow_events.jsonl"
+_STATE_JSON = Path("runtime_state.json")  # 轻量状态快照（DB 不可用时的降级持久化）
+
+
+# ---------- 事件写入（优先 DB → 降级 JSONL） ----------
+def write_event(event_code: str, payload: Dict[str, Any]) -> None:
+    """优先写入 DB 的 EventLog；失败时降级 JSONL。"""
+    if get_session and EventLog:
+        try:
+            with get_session() as s:
+                # 这里假设 EventLog 拥有 (level, code, payload_json, created_at) 等字段
+                rec = EventLog(level="INFO", code=event_code, payload_json=json.dumps(payload, ensure_ascii=False))
+                s.add(rec)
+                s.commit()
+                return
+        except Exception:
+            # 回退到 JSONL
+            pass
+    append_event_jsonl(event_code, payload)
+
+
+def append_event_jsonl(event_code: str, payload: Dict[str, Any]) -> None:
+    """降级 JSONL：每行一条事件，含时间戳。"""
+    at = datetime.now(_SH_TZ).isoformat()
+    with _EVENTS_JSONL.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"event": event_code, "payload": payload, "at": at}, ensure_ascii=False) + "\n")
+
+
+# 为兼容不同调用名，提供别名
+def log_event(event_code: str, payload: Dict[str, Any]) -> None:
+    write_event(event_code, payload)
+
+def append_event(event_code: str, payload: Dict[str, Any]) -> None:
+    write_event(event_code, payload)
+
+
+# ---------- 轻量系统状态（幂等；优先 DB，降级 JSON） ----------
+def _load_state() -> Dict[str, Any]:
+    if _STATE_JSON.exists():
+        try:
+            return json.loads(_STATE_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def _save_state(state: Dict[str, Any]) -> None:
+    _STATE_JSON.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def set_position_cap(cap: float, note: str = "") -> None:
+    """设置全局最大仓位上限（0..1），降级写 runtime_state.json。"""
+    cap = float(cap)
+    state = _load_state()
+    state["position_cap"] = cap
+    if note:
+        state["position_cap_note"] = note
+    state["position_cap_at"] = datetime.now(_SH_TZ).isoformat()
+    _save_state(state)
+
+def enter_sleep_mode(note: str = "") -> None:
+    """进入休眠态（sleeping=True；记录开始时间与备注）。"""
+    state = _load_state()
+    state["sleeping"] = True
+    state["sleep_since"] = datetime.now(_SH_TZ).isoformat()
+    if note:
+        state["sleep_note"] = note
+    _save_state(state)
+
+def exit_sleep_mode(note: str = "") -> None:
+    """退出休眠态（恢复活跃；不自动恢复仓位上限，交由上层策略决定）。"""
+    state = _load_state()
+    state["sleeping"] = False
+    state["sleep_cleared_at"] = datetime.now(_SH_TZ).isoformat()
+    if note:
+        state["sleep_clear_note"] = note
+    _save_state(state)
+
+
+# ---------- 查询: restart 所需的最小能力 ----------
+def query_events(code_in: Sequence[str], limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    返回最近的事件记录（列表），元素至少包含 'event' 与 'payload'（兼容 DB/JSONL）。
+    - 若 DB 可用：从 EventLog 取；否则读取 JSONL 的末尾若干行（近似）。
+    """
+    results: List[Dict[str, Any]] = []
+    if get_session and EventLog:
+        try:
+            with get_session() as s:
+                # 这里使用原生 SQL 或 ORM 查询皆可；为兼容性，这里给出保守实现示意
+                # 假设 EventLog 有自增 id，可按 id desc 排序
+                rows = (
+                    s.query(EventLog)  # type: ignore[attr-defined]
+                    .filter(EventLog.code.in_(list(code_in)))  # type: ignore[attr-defined]
+                    .order_by(EventLog.id.desc())              # type: ignore[attr-defined]
+                    .limit(limit)
+                    .all()
+                )
+                for r in rows:
+                    try:
+                        payload = json.loads(getattr(r, "payload_json", "{}") or "{}")
+                    except Exception:
+                        payload = {}
+                    results.append({
+                        "event": getattr(r, "code", ""),
+                        "payload": payload,
+                        "at": getattr(r, "created_at", None),
+                    })
+                return results
+        except Exception:
+            # 回退 JSONL
+            pass
+
+    # JSONL 降级读取（粗略尾部 N 行）
+    try:
+        lines = _EVENTS_JSONL.read_text(encoding="utf-8").splitlines()[-max(50, limit * 3):]
+        for line in reversed(lines):
+            try:
+                rec = json.loads(line)
+                if rec.get("event") in code_in:
+                    results.append(rec)
+                    if len(results) >= limit:
+                        break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return results
+
+
+def get_monthly_drawdown() -> Optional[float]:
+    """
+    占位：返回当月回撤（-0.05 表示 -5%）。
+    若未接入真实净值/权益曲线，这里返回 None；上层会据此判定 B 条件是否开启。
+    """
+    return None
+
+
+# 导出新增符号
+__all__ += [
+    "write_event",
+    "append_event_jsonl",
+    "log_event",
+    "append_event",
+    "set_position_cap",
+    "enter_sleep_mode",
+    "exit_sleep_mode",
+    "query_events",
+    "get_monthly_drawdown",
 ]

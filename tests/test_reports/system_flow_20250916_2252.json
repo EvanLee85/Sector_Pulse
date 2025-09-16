@@ -1,0 +1,25 @@
+{
+  "ts": "2025-09-16T22:52:35.816807+08:00",
+  "prev": "20250915",
+  "window": "22:52",
+  "warn": null,
+  "durations_sec": {
+    "config_load": 0.007,
+    "indicators": 0.0,
+    "gate": 0.012,
+    "killswitch": 0.0152,
+    "total": 0.0343
+  },
+  "gate": {
+    "passed": false,
+    "reasons": [
+      "limit_up_count: None vs 10 (>=",
+      "sh_above_ma20: False vs True (==)"
+    ]
+  },
+  "killswitch": {
+    "level": 0,
+    "triggers": [],
+    "actions": []
+  }
+}

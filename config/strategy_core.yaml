@@ -79,3 +79,96 @@ monitoring:
   performance_alerts: { daily_loss_threshold: -0.03, weekly_loss_threshold: -0.08 }
   system_alerts:      { data_delay_max_minutes: 5, execution_delay_max_seconds: 30 }
   notify: { enabled: false, channels: [] }
+# —— 状态机：迟滞带与上限 —— 
+state:
+  pos_band:
+    enter_offense: 0.55   # <55% 进入进攻
+    exit_offense: 0.65    # ≥65% 退出进攻
+  caps:
+    max_total_position: 0.60
+    max_single_position: 0.20
+    initial_entry_fraction: 0.10
+  board_continuity_days: 2
+  cool_down_days: 2
+
+# —— 明确的状态转移条件（与迟滞/风控配合） —— 
+state_transition:
+  to_offense: { emotion_gate: true,  position_ratio_max: 0.55 }
+  to_hold:    { emotion_gate: true,  position_ratio_min: 0.65 }
+  to_watch:   { emotion_gate: false }
+  to_sleep:   { kill_switch_level: 2 }
+
+# —— 盘前/盘中情绪闸门（Alt-Flow 版）——
+emotion_gate:
+  limit_up_count_min: 30              # ← 原 limit_up_min: 30
+  limitup_down_ratio_min: 0.50        # 新增：涨跌停比阈值（文档口径）
+  turnover_concentration_max: 0.35
+  vol_percentile_max: 0.75
+  ma20_required: true
+  # 说明：两融（EOD）仅作背景记录，不参与闸门开/停判定
+
+# —— 波动率代理（无 QVIX）——
+volatility_proxy:
+  index: "CSI300"
+  window_days: 30
+  lookback_days: 252
+  percentile_method: "rolling"
+
+# —— Kill-Switch 分级（Alt-Flow 版）——
+kill_switch:
+  L1:
+    margin_net_repay_yi: 100         # 两融净偿还 ≥ 100 亿
+    limitup_down_ratio_min: 0.50     # 涨跌停比 < 0.50 触发
+    turnover_concentration_max: 0.45 # 拥挤度过高（示例）
+    vol_percentile_min: 0.85         # 波动分位下限
+    action: stop_new_reduce_cap
+    temp_total_cap: 0.30
+    # —— 新增（仅新增，不改原键）：复合条件所需的指数跌幅阈值（小数收益率）
+    index_down_max: -0.005           # -0.5%
+
+  L2:
+    margin_net_repay_yi: 200
+    limitup_down_ratio_min: 0.20
+    turnover_concentration_max: 0.55
+    vol_percentile_min: 0.90
+    action: liquidate_and_sleep
+    # —— 新增（仅新增，不改原键）：复合条件所需的指数跌幅阈值（小数收益率）
+    index_down_max: -0.015           # -1.5%
+
+# —— 当日回撤风控 —— 
+daily_risk:
+  max_intraday_drawdown: -0.02
+  action_on_max_dd: "stop_new"
+
+# —— 买点微结构与降级 —— 
+microstructure_thresholds:
+  vwap_deviation_abs_max: 0.005
+  volratio_min: 2.0
+  dist_to_day_high_max: 0.02
+
+intraday_fallback:
+  allow_fallback: true
+  on_missing: "mark_unexecutable"
+  vwap_fallback: "cum_turnover/cum_volume"
+  volratio_fallback: "vol_5min / mean(vol_60_120min_recent5d)"
+  near_dayhigh_fallback: "last / day_high_ref - 1"
+
+# —— 持仓管理 —— 
+position_management:
+  stop_loss: -0.04
+  take_profit_1: 0.08
+  take_profit_2: 0.15
+  time_decay: { t3_alert: true, t5_force_close: true }
+  sector_continuity: { check_interval: "daily", exit_top3_days: 2 }
+
+# —— 监控与告警（后续可接入通知渠道）——
+monitoring:
+  performance_alerts: { daily_loss_threshold: -0.03, weekly_loss_threshold: -0.08 }
+  system_alerts:      { data_delay_max_minutes: 5, execution_delay_max_seconds: 30 }
+  notify: { enabled: false, channels: [] }
+
+# —— 休眠态重启条件（仅新增，不影响既有配置）——
+restart_conditions:
+  consecutive_gate_days: 3            # 连续 3 个交易日闸门通过
+  monthly_drawdown_threshold: -0.03   # 月度回撤 ≥ -3%（若未接净值，可改为 null 以关闭此条件）
+  manual_confirm: true                # 是否需要人工确认

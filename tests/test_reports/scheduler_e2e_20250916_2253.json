@@ -1,0 +1,13 @@
+{
+  "ts": "2025-09-16T22:53:42.924880+08:00",
+  "window": "22:53",
+  "durations_sec": {
+    "calendar_refresh": 0.8995,
+    "single_window_total": 18.2405
+  },
+  "observed": {
+    "gate_event_jsonl": false,
+    "ks_event_jsonl": true
+  },
+  "notes": "如未在 JSONL 看到事件，通常因为写入 DB；可通过 EventLog 侧核验。"
+}

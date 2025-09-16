@@ -340,6 +340,29 @@ def run_trading_task() -> None:
             })
         # ==== 新增结束 ====
 
+        # ==== 新增：Gate→Kill-Switch 串联（复用 gate 指标；不重复取数）====
+        try:
+            from strategy_engine.killswitch.killswitch import check_kill_switch
+            ks_payload = check_kill_switch(
+                prev_trade_yyyymmdd=prev_yyyymmdd,
+                window=now.strftime("%H:%M"),
+                indicators_payload=gate_payload.get("indicators") if isinstance(gate_payload, dict) else None,
+                config_dir="config",
+                emit_event=True,   # 由 killswitch 内部写 altflow/ks_L{1,2}/ks_L0 事件
+            )
+            _log_event("INFO", "altflow_ks_done", {
+                "window": now.strftime("%H:%M"),
+                "prev_trade": prev_yyyymmdd,
+                "level": ks_payload.get("level"),
+                "triggered": ks_payload.get("triggered_conditions"),
+            })
+        except Exception as e:
+            _log_event("ERROR", "altflow_ks_error", {
+                "window": now.strftime("%H:%M"),
+                "err": str(e),
+            })
+        # ==== 新增结束 ====
+
     else:
         _log_event("INFO", "scheduler_skip", {**payload, "action": "SKIP"})
 
@@ -355,6 +378,27 @@ def run_data_preheat_task() -> None:
         "degraded": _CALENDAR_DEGRADED,
         "staleness_days": _CALENDAR_STALENESS_DAYS,
     })
+
+# ==== 新增：09:30 休眠态重启资格检查 ====
+def _job_restart_check() -> None:
+    """
+    每个交易日 09:30 检查是否满足“可重启”条件：
+    A) 最近连续 N 日闸门通过；B) 月度回撤 ≥ 阈值（可选）
+    满足时落 restart/eligible；若配置 manual_confirm=false，则自动确认并尝试 exit_sleep_mode。
+    """
+    try:
+        rc = (_CFG.get("restart_conditions") or {})
+        consecutive_gate_days = int(rc.get("consecutive_gate_days", 3))
+        monthly_dd = rc.get("monthly_drawdown_threshold", -0.03)
+        manual_confirm = bool(rc.get("manual_confirm", True))
+
+        # 局部导入，避免顶层循环依赖
+        from strategy_engine.killswitch.killswitch import check_restart_eligibility
+        res = check_restart_eligibility(consecutive_gate_days, monthly_dd, manual_confirm)
+        _log_event("INFO", "restart_check_done", {"result": res})
+    except Exception as e:
+        _log_event("ERROR", "restart_check_error", {"err": str(e)})
+# ==== 新增结束 ====
 
 # ======================
 # 调度器创建 / 启停
@@ -406,6 +450,18 @@ def create_scheduler() -> BackgroundScheduler:
             minute=0,
             replace_existing=True,
         )
+
+    # ==== 新增：09:30 重启资格检查 ====
+    scheduler.add_job(
+        _job_restart_check,
+        "cron",
+        id="restart_check_0930",
+        day_of_week="mon-fri",
+        hour=9,
+        minute=30,
+        replace_existing=True,
+    )
+    # ==== 新增结束 ====
 
     return scheduler
 
