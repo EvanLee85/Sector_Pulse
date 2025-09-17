@@ -1,0 +1,28 @@
+{
+  "ts": "2025-09-17T13:59:34.806142+08:00",
+  "prev": "20250916",
+  "window": "13:59",
+  "warn": null,
+  "durations_sec": {
+    "config_load": 0.0082,
+    "indicators": 13.0367,
+    "gate": 0.0222,
+    "killswitch": 0.0164,
+    "total": 13.0834
+  },
+  "gate": {
+    "passed": true,
+    "reasons": []
+  },
+  "killswitch": {
+    "level": 2,
+    "triggers": [
+      "margin_net_repay_yi_prev≥200"
+    ],
+    "actions": [
+      "stop_new_orders",
+      "force_liquidation",
+      "sleep_mode"
+    ]
+  }
+}
