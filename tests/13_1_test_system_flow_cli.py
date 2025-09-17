@@ -7,10 +7,10 @@
 - 输出：11/12 风格 [OK]/[FAIL]/[WARN] + JSON 报告 ./tests/test_reports/...
 
 # 离线（稳定复现，无需外网）
-python -m tests.13_system_flow_cli --noapi --strict
+python -m tests.13_1_test_system_flow_cli --noapi --strict
 
 # 在线（一次 Alt-Flow 真实取数，可能有 WARN）
-python -m tests.13_system_flow_cli --strict
+python -m tests.13_1_test_system_flow_cli --strict
 
 """
 

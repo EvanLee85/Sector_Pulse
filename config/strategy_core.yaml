@@ -90,6 +90,7 @@ state:
     initial_entry_fraction: 0.10
   board_continuity_days: 2
   cool_down_days: 2
+  observe_position_threshold: 0.30
 
 # —— 明确的状态转移条件（与迟滞/风控配合） —— 
 state_transition:

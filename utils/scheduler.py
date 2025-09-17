@@ -30,6 +30,7 @@ from models.database import (
     SystemState,
     create_db_and_tables,
     get_session,
+    Account,
 )
 
 # ======================
@@ -277,6 +278,44 @@ def restore_state_from_snapshot() -> Optional[SystemState]:
     return _CURRENT_STATE
 
 # ======================
+# 状态机（步骤4）：迟滞带 + 完整约束
+# ======================
+
+def decide_state(emotion_pass: bool, position_ratio: float, ks_level: int, current_state: str, *, 
+                 enter_offense: float, exit_offense: float, observe_threshold: float) -> Dict[str, Any]:
+    """
+    - sleep：ks_level==2 强制休眠
+    - 情绪通过：迟滞带 55%/65%（enter_offense/exit_offense）
+    - 情绪未通过：仅当仓位<=observe_threshold 时进入观望，否则保持持仓
+    返回：{"state": "OFFENSE|HOLD|WATCH|SLEEP", "reason": "..."}
+    """
+    # 1) Kill-Switch L2：强制休眠
+    if ks_level == 2:
+        return {"state": "SLEEP", "reason": "ks_L2"}
+
+    # 标准化当前状态名
+    cs = (current_state or "").upper()
+    if cs not in {"OFFENSE","HOLD","WATCH","SLEEP"}:
+        cs = "HOLD"  # 合理默认
+
+    # 2) 情绪通过 → 迟滞带
+    if emotion_pass:
+        # 进入进攻：当前为 watch/offense，且仓位 < enter_offense
+        if cs in {"WATCH","OFFENSE"} and position_ratio < enter_offense:
+            return {"state": "OFFENSE", "reason": f"emotion_pass & pos<{enter_offense:.2f}"}
+        # 进入持仓：当前为 offense/hold，且仓位 >= exit_offense
+        if cs in {"OFFENSE","HOLD"} and position_ratio >= exit_offense:
+            return {"state": "HOLD", "reason": f"emotion_pass & pos>={exit_offense:.2f}"}
+        # 其余保持原态，避免 58–62% 抖动
+        return {"state": cs, "reason": "emotion_pass & hysteresis_hold"}
+
+    # 3) 情绪未通过 → 观望约束
+    if position_ratio <= observe_threshold:
+        return {"state": "WATCH", "reason": f"emotion_fail & pos<={observe_threshold:.2f}"}
+    else:
+        return {"state": "HOLD", "reason": f"emotion_fail & pos>{observe_threshold:.2f} keep_hold"}
+
+# ======================
 # 定时任务
 # ======================
 
@@ -363,8 +402,90 @@ def run_trading_task() -> None:
             })
         # ==== 新增结束 ====
 
+        # ==== 新增：KS（Step3）→ 状态机（Step4）串联 ====
+        try:
+            # 1) emotion_pass / ks_level
+            emotion_pass = bool(gate_payload.get("passed")) if isinstance(gate_payload, dict) else False
+            ks_level = int(ks_payload.get("level")) if isinstance(ks_payload, dict) else 0
+
+            # 2) 读取账户最新仓位比（Account 最新快照）
+            from sqlmodel import select
+            from models.database import get_session, Account, StateSnapshot, SystemState
+
+            pos_ratio = 0.0
+            pr_source = None
+            with get_session() as s:
+                acc = s.exec(select(Account).order_by(Account.ts.desc())).first()
+            if acc is not None:
+                if getattr(acc, "position_ratio", None) is not None:
+                    pos_ratio = float(acc.position_ratio)
+                    pr_source = "field:position_ratio"
+                else:
+                    tv = getattr(acc, "total_market_value", None)
+                    ta = getattr(acc, "total_asset", None)
+                    if tv is not None and ta is not None:
+                        ta_val = float(ta)
+                        pos_ratio = (float(tv) / ta_val) if ta_val > 0 else 0.0
+                        pr_source = "calc:tmv/ta"
+            if pr_source is None:
+                _log_event("WARN", "state/pos_ratio_fallback", {
+                    "window": now.strftime("%H:%M"),
+                    "reason": "missing Account.latest; default=0.0",
+                })
+
+            # 3) 当前状态（无则默认 HOLD 更稳）
+            cur_snap = restore_state_from_snapshot()
+            cur_name = cur_snap.name if cur_snap else "HOLD"
+
+            # 4) 读取迟滞与观望阈值（只读配置，不改键名）
+            from config.loader import load_config
+            cfg = load_config("config")
+            st = (cfg.get("state") or {})
+            pos_band = (st.get("pos_band") or {})
+            enter_off = float(pos_band.get("enter_offense", 0.55))
+            exit_off  = float(pos_band.get("exit_offense", 0.65))
+            observe_th = float(st.get("observe_position_threshold", 0.30))  # ← 你已同意新增
+
+            # 5) 决策（decide_state 已在本文件中实现）
+            dec = decide_state(
+                emotion_pass=emotion_pass,
+                position_ratio=pos_ratio,
+                ks_level=ks_level,
+                current_state=cur_name,
+                enter_offense=enter_off,
+                exit_offense=exit_off,
+                observe_threshold=observe_th,
+            )
+            new_name = dec["state"]
+
+            # 6) 落库（仅在状态变化时）
+            if new_name != cur_name:
+                _log_event("INFO", "state/change", {
+                    "from_state": cur_name,
+                    "to_state": new_name,
+                    "trigger_reason": dec.get("reason"),
+                    "emotion_pass": emotion_pass,
+                    "position_ratio": pos_ratio,
+                    "ks_level": ks_level,
+                    "thresholds": {
+                        "enter_offense": enter_off,
+                        "exit_offense": exit_off,
+                        "observe_threshold": observe_th,
+                    },
+                })
+                with get_session() as s:
+                    s.add(StateSnapshot(state=SystemState[new_name], pos_ratio=pos_ratio, note=dec.get("reason")))
+                    s.commit()
+        except Exception as e:
+            _log_event("ERROR", "state/compute_error", {
+                "window": now.strftime("%H:%M"),
+                "err": str(e),
+            })
+        # ==== 新增结束 ====
+
     else:
         _log_event("INFO", "scheduler_skip", {**payload, "action": "SKIP"})
+
 
 def run_data_preheat_task() -> None:
     """09:00 预热：刷新交易日历（未来可扩展行情缓存等）。"""

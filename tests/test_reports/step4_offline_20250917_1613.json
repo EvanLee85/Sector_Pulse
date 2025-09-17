@@ -1,0 +1,31 @@
+{
+  "ts": "2025-09-17T16:13:29.983236+08:00",
+  "mode": "offline",
+  "thresholds": {
+    "enter_off": 0.55,
+    "exit_off": 0.65,
+    "observe_th": 0.3
+  },
+  "cases": {
+    "dec1": {
+      "state": "OFFENSE",
+      "reason": "emotion_pass & hysteresis_hold"
+    },
+    "dec2": {
+      "state": "HOLD",
+      "reason": "emotion_pass & pos>=0.65"
+    },
+    "dec3": {
+      "state": "HOLD",
+      "reason": "emotion_fail & pos>0.30 keep_hold"
+    },
+    "dec4": {
+      "state": "WATCH",
+      "reason": "emotion_fail & pos<=0.30"
+    },
+    "dec5": {
+      "state": "SLEEP",
+      "reason": "ks_L2"
+    }
+  }
+}
