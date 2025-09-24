@@ -173,3 +173,91 @@ restart_conditions:
   consecutive_gate_days: 3            # 连续 3 个交易日闸门通过
   monthly_drawdown_threshold: -0.03   # 月度回撤 ≥ -3%（若未接净值，可改为 null 以关闭此条件）
   manual_confirm: true                # 是否需要人工确认
+
+# === 步骤5 · 漏斗（选板→选股）===
+funnel:
+  # —— 行业强度打分（方案A：加权打分）——
+  sector_rank_range: [3, 5]
+  score_weights:
+    rs: 0.40
+    breadth: 0.25
+    leadership: 0.20
+    fundshare: 0.10
+    continuity: 0.05
+  caps:
+    leadership_abs: 0.10     # |(涨停-跌停)/成分数| 裁剪上限（再映射到 0..1）
+    fundshare_max: 0.15      # 行业资金份额上限（映射到 0..1）
+  rs_window_days: 20
+  breadth_ma: 20
+  continuity_lookback: 1
+
+  # —— 板内 RS_adjusted（价×量×资份额提升）——
+  rs_adjusted:
+    price_window_days: 20
+    volume:
+      short_days: 3
+      long_days: 20
+      clip: [0.5, 3.0]
+      normalize: "percentile_all"
+    fundshare:
+      short_days: 10
+      long_days: 60
+      clip: [0.5, 2.0]
+      normalize: "percentile_in_sector"
+    regime_weights:
+      OFFENSE: { price: 0.55, volume: 0.30, fund: 0.15 }
+      HOLD:    { price: 0.45, volume: 0.35, fund: 0.20 }
+      WATCH:   { price: 0.35, volume: 0.45, fund: 0.20 }
+      SLEEP:   { price: 0.00, volume: 0.00, fund: 0.00 }
+
+  # —— 10日均额阈值（自适应上限）——
+  amount_10d_min: 5e8
+  amount_10d_upper_policy:
+    mode: "auto"          # auto|hard|soft
+    percentiles:
+      offense_soft: 0.80
+      hold_soft:    0.75
+      watch_soft:   0.70
+      hard:         0.90
+    floors_caps:
+      soft_floor: 1e9
+      hard_cap:   3e9
+    penalty: 0.90
+    lookback_days: 1
+  amount_10d_fill:
+    lookback_days: 15
+    min_valid_days: 7
+
+  # —— 候选/配额与拒绝原因 —— 
+  rs_min: 0.75
+  stock_rank_range: [3, 5]      # 板内只取 3–5 名
+  max_candidates_per_window: 5
+  per_sector_cap: 2
+
+  # —— EV/RR/Pwin 在步骤5阶段使用口径：软约束 —— 
+  ev_rr_pwin:
+    mode: "soft"            # soft|hard|off
+    thresholds:
+      rr_min: 2.0
+      pwin_min: 0.55
+      ev_bps_min: 60
+    extreme_hard_reject: false
+
+  # —— 与状态/风控协同 —— 
+  exec_policy:
+    on_sleep: "skip"              # ks_L2 或 state=SLEEP：不产出可执行候选（可写快照）
+    on_ks_L1: "observe_only"      # 仅观察
+    on_watch: "observe_only"      # 仅观察
+    on_offense_hold: "normal"     # 正常
+
+  # ====== 仅新增：为“在线链路版 sector_pulse_v3”做兼容，占位不影响现状 ======
+  # 在线链路里的个股过滤读取这个可选“硬上限”，为 0 表示关闭硬上限（默认即可）。
+  amount_10d_max: 0
+
+  # 申万行业在线口径（占位）：等 providers / collector 衔接后启用。
+  industry:
+    provider: "sws"     # 申万行业
+    l1_codes: []        # 示例：["801010.SI","801020.SI", ...]；留空=不强制枚举
+    name_map: {}        # 可选：{"801010.SI": "农林牧渔", ...}
+    min_components: 10  # 成分股太少的行业在在线评分时可跳过
+    cache_days: 3       # 成分缓存有效期（接入后可用）

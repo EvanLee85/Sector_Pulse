@@ -13,7 +13,9 @@ import json
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, List
+import math
+import pandas as pd
 
 import pytz  # APScheduler 推荐 pytz
 from apscheduler.executors.pool import ThreadPoolExecutor
@@ -31,7 +33,18 @@ from models.database import (
     create_db_and_tables,
     get_session,
     Account,
+    Signal,
 )
+
+from config.loader import load_config
+
+def _load_yaml_merged(config_dir: str, _ignored_main_file: str = "") -> dict:
+    """
+    兼容旧签名：忽略第二个参数，底层用 load_config 合并 base.yaml/strategy_core.yaml/dev.override.yaml
+    """
+    from config.loader import load_config
+    return load_config(config_dir) or {}
+
 
 # ======================
 # 配置与常量
@@ -91,6 +104,658 @@ def _log_event(level: str, code: str, payload: Dict[str, Any]) -> None:
     with get_session() as s:
         s.add(EventLog(level=level, code=code, payload_json=json.dumps(payload, ensure_ascii=False)))
         s.commit()
+
+# ======================
+# 步骤5 · 漏斗（选板→选股）
+# ======================
+
+def _percentile_rank(series: List[float], x: float) -> float:
+    vals = [v for v in series if v is not None and not math.isnan(v)]
+    if not vals:
+        return 0.0
+    vals = sorted(vals)
+    # 经典 PR = (#<=x)/n
+    import bisect
+    k = bisect.bisect_right(vals, x)
+    return max(0.0, min(1.0, k / len(vals)))
+
+def _load_funnel_cfg() -> Dict[str, Any]:
+    from config.loader import load_config
+    cfg = load_config("config")
+    return (cfg or {}).get("funnel", {}) or {}
+
+def _should_skip_by_state_and_ks(state: str, ks_level: int, cfg: Dict[str, Any]) -> Tuple[str, bool]:
+    """返回 (mode, executable_flag)。mode: skip|observe_only|normal"""
+    execp = (cfg.get("exec_policy") or {})
+    if ks_level >= 2 or state == "SLEEP":
+        return execp.get("on_sleep", "skip"), False
+    if ks_level == 1:
+        return execp.get("on_ks_L1", "observe_only"), False
+    if state == "WATCH":
+        return execp.get("on_watch", "observe_only"), False
+    return execp.get("on_offense_hold", "normal"), True
+
+def _calc_soft_hard_upper(amounts_all: List[float], state: str, cfg: Dict[str, Any]) -> Tuple[float, float, float]:
+    pol = cfg.get("amount_10d_upper_policy") or {}
+    mode = (pol.get("mode") or "auto").lower()
+    floors = pol.get("floors_caps") or {}
+    soft_floor = float(floors.get("soft_floor", 1e9))
+    hard_cap   = float(floors.get("hard_cap",   3e9))
+    if mode == "hard":
+        hard = float(cfg.get("amount_10d_max", 1e9))
+        return soft_floor, hard, float(pol.get("penalty", 0.9))
+    if not amounts_all:
+        return soft_floor, hard_cap, float(pol.get("penalty", 0.9))
+
+    p = pol.get("percentiles") or {}
+    soft_map = {"OFFENSE": p.get("offense_soft", 0.80),
+                "HOLD":    p.get("hold_soft",    0.75),
+                "WATCH":   p.get("watch_soft",   0.70)}
+    soft_pct = float(soft_map.get(state, 0.75))
+    hard_pct = float(p.get("hard", 0.90))
+
+    try:
+        import numpy as np
+        soft_up = float(np.quantile(amounts_all, soft_pct))
+        hard_up = float(np.quantile(amounts_all, hard_pct))
+    except Exception:
+        xs = sorted(v for v in amounts_all if v is not None)
+        def _q(q: float) -> float:
+            if not xs: return 0.0
+            i = int(max(0, min(len(xs)-1, round(q*(len(xs)-1)))))
+            return float(xs[i])
+        soft_up = _q(soft_pct)
+        hard_up = _q(hard_pct)
+
+    soft_up = max(soft_up, soft_floor)
+    hard_up = min(hard_up, hard_cap)
+    return soft_up, hard_up, float(pol.get("penalty", 0.9))
+
+def _funnel_emit_snapshot(sector_snapshot: Dict[str, Any],
+                          selected: List[Dict[str, Any]],
+                          rejected: List[Dict[str, Any]],
+                          window: str,
+                          note: str = "") -> int:
+    payload = {
+        "window": window,
+        "sector_rankings_snapshot": sector_snapshot,
+        "selected_candidates": selected,
+        "rejected": rejected,
+        "note": note,
+    }
+    with get_session() as s:
+        ev = EventLog(level="INFO", code="funnel/result",
+                      payload_json=json.dumps(payload, ensure_ascii=False))
+        s.add(ev)
+        s.commit()
+        return int(ev.id or 0)
+
+def _select_candidates_funnel_offline_compatible(
+    state: str,
+    ks_level: int,
+    window: str,
+    indicators_payload: Optional[Dict[str, Any]],
+    injected: Dict[str, Any],
+    emit_event: bool
+) -> Dict[str, Any]:
+    """
+    与 16_test_funnel_offline 兼容的离线路径：
+    - 使用 injected["sectors"] / injected["stocks"] / injected["amounts_all"]
+    - 权重、阈值、配额全部读取 funnel 配置
+    - 事件快照：funnel/result
+    - Signal 入库：selected 可执行与否取决于 exec policy（state / ks_level）
+    """
+    cfg = _load_funnel_cfg()
+    mode, can_exec = _should_skip_by_state_and_ks(state, ks_level, cfg)
+
+    # —— 行业强度（加权打分）——
+    sector_scores: List[Dict[str, Any]] = []
+    w = cfg.get("score_weights") or {}
+    rsw = float(w.get("rs", 0.40))
+    bw  = float(w.get("breadth", 0.25))
+    lw  = float(w.get("leadership", 0.20))
+    fw  = float(w.get("fundshare", 0.10))
+    cw  = float(w.get("continuity", 0.05))
+
+    caps = cfg.get("caps") or {}
+    lead_cap = float(caps.get("leadership_abs", 0.10))
+    fund_cap = float(caps.get("fundshare_max", 0.15))
+
+    for x in injected.get("sectors", []):
+        lead_raw = float(x.get("lead", 0.0))
+        lead_raw = max(-lead_cap, min(lead_cap, lead_raw))
+        lead_norm = (lead_raw + lead_cap) / (2 * lead_cap) if lead_cap > 0 else 0.5
+        fund_norm = min(float(x.get("fundshare", 0.0)), fund_cap) / fund_cap if fund_cap > 0 else 0.0
+        sc = (
+            rsw * float(x.get("rs", 0.0))
+            + bw * float(x.get("breadth", 0.0))
+            + lw * lead_norm
+            + fw * fund_norm
+            + cw * float(x.get("continuity", 0.0))
+        )
+        sector_scores.append({
+            "name": x.get("name"),
+            "score": sc,
+            "parts": {
+                "rs": x.get("rs", 0.0),
+                "breadth": x.get("breadth", 0.0),
+                "lead_norm": lead_norm,
+                "fund_norm": fund_norm,
+                "continuity": x.get("continuity", 0.0),
+            }
+        })
+
+    sector_scores = sorted(sector_scores, key=lambda d: d["score"], reverse=True)
+    sr = cfg.get("sector_rank_range") or [3, 5]
+    rank_lo, rank_hi = int(sr[0]), int(sr[1])
+    selected_sectors = [d["name"] for i, d in enumerate(sector_scores, start=1) if rank_lo <= i <= rank_hi]
+
+    # —— 板内个股 ——（RS_adjusted + 10D 均额上下限 + EV/RR/Pwin 软约束）
+    wmap = (cfg.get("rs_adjusted", {}).get("regime_weights") or {}).get(state, {})
+    wp = float(wmap.get("price", 0.55 if state == "OFFENSE" else 0.45))
+    wv = float(wmap.get("volume", 0.30))
+    wf = float(wmap.get("fund", 0.15))
+
+    rs_min = float(cfg.get("rs_min", 0.75))
+    stock_rank_range = cfg.get("stock_rank_range") or [3, 5]
+    rlo, rhi = int(stock_rank_range[0]), int(stock_rank_range[1])
+
+    per_sector_cap = int(cfg.get("per_sector_cap", 2))
+    per_window_cap = int(cfg.get("max_candidates_per_window", 5))
+
+    amounts_all = injected.get("amounts_all") or []
+    soft_up, hard_up, penalty = _calc_soft_hard_upper(amounts_all, state, cfg)
+
+    selected: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    per_sector_count: Dict[str, int] = {}
+
+    for row in injected.get("stocks", []):
+        sym = str(row["symbol"])
+        sec = str(row.get("sector", ""))
+
+        # 行业是否在 3–5 名
+        if sec not in selected_sectors:
+            rejected.append({"symbol": sym, "sector": sec, "reason_reject": "sector_rank_out_of_range"})
+            continue
+
+        # 计算 rs_adj
+        rprice = float(row.get("rs_price", 0.0))
+        rvol   = float(row.get("rs_volume", 0.0))
+        rfund  = float(row.get("rs_fund", 0.0))
+        rs_adj = wp * rprice + wv * rvol + wf * rfund
+
+        a10 = float(row.get("amount_10d", 0.0))
+        rr  = float(row.get("rr", 0.0))
+        pwin = float(row.get("pwin", 0.0))
+        ev_bps = float(row.get("ev_bps", 0.0))
+        rnk = int(row.get("rank_in_sector", 99))
+
+        # 严格 rank 3–5
+        if not (rlo <= rnk <= rhi):
+            rejected.append({
+                "symbol": sym, "sector": sec, "reason_reject": "rank_out_of_range",
+                "rank_in_sector": rnk, "rs_adj": rs_adj
+            })
+            continue
+
+        # rs 下限
+        if rs_adj < rs_min:
+            rejected.append({"symbol": sym, "sector": sec, "reason_reject": "rs_below_min",
+                             "rs_adj": rs_adj, "rs_min": rs_min})
+            continue
+
+        # 10D 均额：下限 + 上限/惩罚
+        if a10 < float(cfg.get("amount_10d_min", 5e8)):
+            rejected.append({"symbol": sym, "sector": sec, "reason_reject": "amount_10d_below_min",
+                             "amount_10d": a10})
+            continue
+        oversize = False
+        penalty_applied = 1.0
+        if a10 > hard_up:
+            rejected.append({"symbol": sym, "sector": sec, "reason_reject": "amount_10d_above_max",
+                             "amount_10d": a10, "hard_upper": hard_up})
+            continue
+        elif a10 > soft_up:
+            oversize = True
+            penalty_applied = penalty
+            rs_adj *= penalty
+
+        # EV/RR/Pwin 软约束（标注，不强拒）
+        ev_cfg = cfg.get("ev_rr_pwin") or {}
+        t = ev_cfg.get("thresholds") or {}
+        rr_min = float(t.get("rr_min", 2.0))
+        pwin_min = float(t.get("pwin_min", 0.55))
+        ev_min = float(t.get("ev_bps_min", 60))
+        tags = []
+        if rr and rr < rr_min: tags.append("rr_low")
+        if pwin and pwin < pwin_min: tags.append("pwin_low")
+        if ev_bps and ev_bps < ev_min: tags.append("ev_low")
+
+        # 行业/窗口配额
+        if per_sector_count.get(sec, 0) >= per_sector_cap:
+            rejected.append({"symbol": sym, "sector": sec, "reason_reject": "sector_quota_exceeded"})
+            continue
+        if len(selected) >= per_window_cap:
+            rejected.append({"symbol": sym, "sector": sec, "reason_reject": "window_quota_exceeded"})
+            break
+
+        selected.append({
+            "symbol": sym, "sector": sec, "rank_in_sector": rnk,
+            "rs_price": rprice, "rs_volume": rvol, "rs_fund": rfund,
+            "rs_adj": rs_adj, "penalty": penalty_applied, "oversize": oversize,
+            "amount_10d": a10, "rr": rr, "pwin": pwin, "ev_bps": ev_bps,
+        })
+        per_sector_count[sec] = per_sector_count.get(sec, 0) + 1
+
+    # —— 快照事件 + Signal 入库 —— 
+    ev_id = 0
+    if emit_event:
+        sector_snapshot = {"scores": sector_scores, "rank_range": [rank_lo, rank_hi]}
+        ev_id = _funnel_emit_snapshot(sector_snapshot, selected, rejected, window)
+
+    from models.database import get_session, Signal, SystemState
+    with get_session() as s:
+        for it in selected:
+            s.add(Signal(
+                symbol=it["symbol"], side="buy", price_ref=None,
+                state_at_emit=SystemState(state) if state in SystemState.__members__ else None,
+                emotion_gate_passed=None,
+                executable=bool(can_exec and (mode == "normal")),
+                reason_reject=None, window=window,
+                microstructure_checks=json.dumps({
+                    "rs_price": it["rs_price"], "rs_volume": it["rs_volume"], "rs_fund": it["rs_fund"],
+                    "rs_adj": it["rs_adj"], "amount_10d": it["amount_10d"],
+                    "oversize": it.get("oversize", False), "penalty": it.get("penalty", 1.0),
+                    "ctx_event_id": ev_id,
+                }, ensure_ascii=False)
+            ))
+        for it in rejected:
+            s.add(Signal(
+                symbol=it.get("symbol", "?"), side="buy", price_ref=None,
+                state_at_emit=SystemState(state) if state in SystemState.__members__ else None,
+                emotion_gate_passed=None,
+                executable=False,
+                reason_reject=it.get("reason_reject", ""),
+                window=window,
+                microstructure_checks=json.dumps(
+                    {k: v for k, v in it.items() if k not in ("symbol", "reason_reject")},
+                    ensure_ascii=False
+                )
+            ))
+        s.commit()
+
+    return {
+        "selected": selected,
+        "rejected": rejected,
+        "executable": bool(can_exec and (mode == "normal")),
+        "event_id": ev_id,
+        "selected_sectors": selected_sectors,
+    }
+
+
+def select_candidates_funnel(state: str,
+                             ks_level: int,
+                             window: str,
+                             indicators_payload: Optional[Dict[str, Any]] = None,
+                             injected: Optional[Dict[str, Any]] = None,
+                             emit_event: bool = True) -> Dict[str, Any]:
+    """
+    步骤5主函数（在线优先，离线注入可覆盖）：
+    - 在线：申万 L1 桶 + L1 成分（必要时 L3 回填） + 全市场快照 + 前复权日线，按既定口径打分/筛选
+    - 离线：若提供 injected，则走原离线路径（与你当前一致）
+    - 结果：≤5只、每行业≤2只；严格板内3–5名约束；事件与Signal入库
+    """
+    cfg = _load_funnel_cfg()
+    mode, can_exec = _should_skip_by_state_and_ks(state, ks_level, cfg)
+    if mode == "skip":
+        if emit_event:
+            _log_event("WARN", "funnel/skipped", {
+                "window": window, "state": state, "ks_level": ks_level, "reason": "exec_policy_skip"
+            })
+        return {"selected": [], "rejected": [], "executable": False, "skipped": True}
+
+    # ------------------------------
+    # A) 若提供 injected → 走你原本离线路径（保持不变）
+    # ------------------------------
+    if injected and ("sectors" in injected or "stocks" in injected):
+        return _select_candidates_funnel_offline_compatible(
+            state=state, ks_level=ks_level, window=window,
+            indicators_payload=indicators_payload, injected=injected, emit_event=emit_event
+        )
+
+    # ------------------------------
+    # B) 在线链路（真实数据）
+    # ------------------------------
+    from data_service.collector import (
+        fetch_sw_index_first_info, fetch_sw_l1_components, fetch_sw_index_third_info,
+        fetch_market_spot_with_fallback, fetch_limit_up_pool, fetch_limit_down_pool,
+        fetch_stock_daily_qfq
+    )
+    from models.database import get_session, EventLog, Signal, SystemState
+
+    # 配置参数
+    sr = cfg.get("sector_rank_range") or [3, 5]
+    rank_lo, rank_hi = int(sr[0]), int(sr[1])
+    w = cfg.get("score_weights") or {}
+    w_rs = float(w.get("rs", 0.40))
+    w_bd = float(w.get("breadth", 0.25))
+    w_ld = float(w.get("leadership", 0.20))
+    w_fs = float(w.get("fundshare", 0.10))
+    w_ct = float(w.get("continuity", 0.05))  # 目前在线先置 0（可后续接入）
+
+    caps = cfg.get("caps") or {}
+    lead_cap = float(caps.get("leadership_abs", 0.10))
+    fund_cap = float(caps.get("fundshare_max", 0.15))
+
+    rs_win = int(cfg.get("rs_window_days", 20))
+    rs_min = float(cfg.get("rs_min", 0.75))
+    stock_rank_range = cfg.get("stock_rank_range") or [3, 5]
+    rlo, rhi = int(stock_rank_range[0]), int(stock_rank_range[1])
+
+    per_sector_cap = int(cfg.get("per_sector_cap", 2))
+    per_window_cap = int(cfg.get("max_candidates_per_window", 5))
+
+    # 取上一个交易日（用于涨/跌停池）
+    now = now_cn()
+    prev_yyyymmdd = _get_prev_trade_yyyymmdd(now.date())
+
+    # 1) 准备全市场快照（用于资金份额） + 昨日涨/跌停池（用于 leadership）
+    try:
+        spot_res = fetch_market_spot_with_fallback()
+        df_spot = spot_res.data if hasattr(spot_res, "data") else None
+        if not isinstance(df_spot, pd.DataFrame) or df_spot.empty:
+            raise RuntimeError("market spot empty")
+        # 尽量统一 amount 列
+        if "amount_yuan" not in df_spot.columns:
+            # 简单兜底：若没有 amount_yuan，尝试常见列名
+            for c in ("成交额", "成交额(元)", "amount"):
+                if c in df_spot.columns:
+                    df_spot = df_spot.copy()
+                    df_spot["amount_yuan"] = pd.to_numeric(df_spot[c], errors="coerce")
+                    break
+        total_amount = float(pd.to_numeric(df_spot.get("amount_yuan", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    except Exception as e:
+        _log_event("ERROR", "funnel/error", {"window": window, "stage": "market_spot", "err": str(e)})
+        total_amount = 0.0
+        df_spot = pd.DataFrame()
+
+    try:
+        zt_res = fetch_limit_up_pool(prev_yyyymmdd); df_zt = zt_res.data if hasattr(zt_res, "data") else None
+    except Exception:
+        df_zt = None
+    try:
+        dt_res = fetch_limit_down_pool(prev_yyyymmdd); df_dt = dt_res.data if hasattr(dt_res, "data") else None
+    except Exception:
+        df_dt = None
+
+    zt_set = set()
+    dt_set = set()
+    if isinstance(df_zt, pd.DataFrame) and not df_zt.empty:
+        col = "股票代码" if "股票代码" in df_zt.columns else ("code" if "code" in df_zt.columns else None)
+        if col:
+            zt_set = {str(x).strip() for x in df_zt[col].dropna().tolist()}
+    if isinstance(df_dt, pd.DataFrame) and not df_dt.empty:
+        col = "股票代码" if "股票代码" in df_dt.columns else ("code" if "code" in df_dt.columns else None)
+        if col:
+            dt_set = {str(x).strip() for x in df_dt[col].dropna().tolist()}
+
+    # 2) 取申万 L1 列表
+    try:
+        l1_info = fetch_sw_index_first_info()
+        df_l1 = l1_info.data
+        if not isinstance(df_l1, pd.DataFrame) or df_l1.empty:
+            raise RuntimeError("sw_index_first_info empty")
+        # 统一列
+        df_l1 = df_l1.rename(columns={"行业代码": "l1_code", "行业名称": "l1_name", "成份个数": "count"})
+        df_l1["l1_code"] = df_l1["l1_code"].astype(str).str.replace(".SI", "", regex=False)
+    except Exception as e:
+        _log_event("ERROR", "funnel/error", {"window": window, "stage": "sw_l1_list", "err": str(e)})
+        df_l1 = pd.DataFrame(columns=["l1_code", "l1_name", "count"])
+
+    # 3) 行业打分（rs / breadth / leadership / fundshare / continuity）
+    sector_scores: List[Dict[str, Any]] = []
+
+    for _, row in df_l1.iterrows():
+        code = str(row.get("l1_code") or "").strip()
+        name = str(row.get("l1_name") or "").strip()
+        if not code or not name:
+            continue
+
+        # 3.1 取成分（L1 主口径；失败则尝试 L3 回填）
+        try:
+            symbols = fetch_sw_l1_components(code)  # 返回 6位+后缀 或 6位（源而定）
+        except Exception:
+            symbols = []
+        if not symbols:
+            # 回填尝试（用 L3 汇总，当前 collector 内部已做容错，这里简单再判空即可）
+            symbols = fetch_sw_l1_components(code, fallback_l3_codes=None)
+        if not symbols:
+            continue
+
+        # 将不带后缀的，尽量与 df_spot 合并时做 left-join 容错
+        sym_set = set(str(s).upper() for s in symbols)
+
+        # 3.2 leadership：用昨日涨/跌停池
+        #     leadership_raw = (涨停数 - 跌停数) / 成分数，裁剪到 [-lead_cap, +lead_cap] 并映射到 [0,1]
+        if sym_set:
+            zt_n = len(sym_set & {s.upper() for s in zt_set})
+            dt_n = len(sym_set & {s.upper() for s in dt_set})
+            raw = 0.0
+            try:
+                raw = (zt_n - dt_n) / max(len(sym_set), 1)
+            except Exception:
+                raw = 0.0
+            ld_raw = max(-lead_cap, min(lead_cap, float(raw)))
+            ld = (ld_raw + lead_cap) / (2 * lead_cap) if lead_cap > 0 else 0.5
+        else:
+            ld = 0.5
+
+        # 3.3 fundshare：用当日全市场成交额占比（若无成交额列，则置 0）
+        fs = 0.0
+        if isinstance(df_spot, pd.DataFrame) and not df_spot.empty and total_amount > 0:
+            # 尝试用“代码/股票代码/证券代码”等字段名匹配
+            code_cols = [c for c in ("代码", "股票代码", "code", "symbol") if c in df_spot.columns]
+            if code_cols:
+                ccol = code_cols[0]
+                sub = df_spot[df_spot[ccol].astype(str).str.upper().isin(sym_set)]
+                fs_amount = float(pd.to_numeric(sub.get("amount_yuan", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+                fs_raw = fs_amount / total_amount
+                fs = min(fs_raw, fund_cap) / fund_cap if fund_cap > 0 else 0.0
+
+        # 3.4 rs & breadth：对成分**抽样**拉 20d 日线，计算均值（控制耗时）
+        #     - 为避免过重，这里最多抽样 30 只（可按需调大）
+        rs_vals = []
+        up_flags = []
+        sample_list = list(sym_set)[:30]
+        for sym in sample_list:
+            try:
+                r = fetch_stock_daily_qfq(sym)
+                df = r.data
+                if not isinstance(df, pd.DataFrame) or df.shape[0] < (rs_win + 1):
+                    continue
+                # 取最近 rs_win+1 根，计算 N 日涨跌幅与当日涨跌
+                d = df.tail(rs_win + 1).reset_index(drop=True)
+                p0, p1 = float(d.loc[0, "close"]), float(d.loc[len(d) - 1, "close"])
+                if p0 > 0:
+                    rs_vals.append((p1 / p0) - 1.0)
+                # 当日涨跌
+                if len(d) >= 2:
+                    up_flags.append(float(d.loc[len(d) - 1, "close"]) >= float(d.loc[len(d) - 2, "close"]))
+            except Exception:
+                continue
+
+        sec_rs = float(pd.Series(rs_vals, dtype=float).mean()) if rs_vals else 0.0
+        breadth = float(pd.Series(up_flags, dtype=float).mean()) if up_flags else 0.0
+
+        score = w_rs * sec_rs + w_bd * breadth + w_ld * ld + w_fs * fs + w_ct * 0.0
+        sector_scores.append({
+            "name": name, "code": code, "score": score,
+            "parts": {"rs": sec_rs, "breadth": breadth, "lead_norm": ld, "fund_norm": fs, "continuity": 0.0}
+        })
+
+    # 3.5 排序取 3–5 名行业
+    sector_scores = sorted(sector_scores, key=lambda d: d["score"], reverse=True)
+    selected_sectors = [d["name"] for i, d in enumerate(sector_scores, start=1) if rank_lo <= i <= rank_hi]
+    selected_sector_codes = [d["code"] for i, d in enumerate(sector_scores, start=1) if rank_lo <= i <= rank_hi]
+
+    # 4) 入选行业 → 板内个股 RS_adjusted（价×量×资份额代理），按 rs_adj 排名后严格取 rank 3–5
+    #    - 资份额代理：用 “当日 amount / 近10日均额” 的相对强弱（再按行业内分位归一）
+    #    - 10日均额下限 + 自适应上限
+    selected: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    amounts_all = []
+    # 准备 regime 权重
+    wmap = (cfg.get("rs_adjusted", {}).get("regime_weights") or {}).get(state, {})
+    wp = float(wmap.get("price", 0.55 if state == "OFFENSE" else 0.45))
+    wv = float(wmap.get("volume", 0.30))
+    wf = float(wmap.get("fund", 0.15))
+
+    soft_up, hard_up, penalty = _calc_soft_hard_upper(amounts_all, state, cfg)
+    per_selected_cap = 0
+
+    for sec_code, sec_name in zip(selected_sector_codes, selected_sectors):
+        comps = fetch_sw_l1_components(sec_code)
+        if not comps:
+            continue
+
+        # 拉所有成分的近 60 日（足够覆盖 20D 与 10D 计算）
+        rows: List[Dict[str, Any]] = []
+        for sym in comps:
+            try:
+                r = fetch_stock_daily_qfq(sym)
+                df = r.data
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    continue
+                # 价格 RS（20日）
+                if df.shape[0] < (rs_win + 1):
+                    continue
+                dd = df.tail(max(rs_win + 10, 35)).reset_index(drop=True)  # 多留些给均量
+                p0, p1 = float(dd.loc[len(dd) - (rs_win + 1), "close"]), float(dd.loc[len(dd) - 1, "close"])
+                if p0 <= 0:
+                    continue
+                rs_price = (p1 / p0) - 1.0
+                # 量（3/20）
+                vol = pd.to_numeric(dd["amount"], errors="coerce").fillna(0.0)
+                sma3 = float(vol.tail(3).mean()) if len(vol) >= 3 else 0.0
+                sma20 = float(vol.tail(20).mean()) if len(vol) >= 20 else max(sma3, 1.0)
+                rs_volume = 0.0 if sma20 <= 0 else (sma3 / sma20)
+                # 资份额代理：当日 amount / 10日均额（行业内分位再归一）
+                a10 = float(vol.tail(10).mean()) if len(vol) >= 10 else float(vol.mean())
+                a_today = float(vol.iloc[-1]) if len(vol) else 0.0
+                fund_ratio = 0.0 if a10 <= 0 else (a_today / a10)
+                rows.append({
+                    "symbol": sym, "sector": sec_name,
+                    "rs_price": rs_price, "rs_volume": rs_volume,
+                    "fund_ratio": fund_ratio, "amount_10d": a10,
+                })
+                amounts_all.append(a10)
+            except Exception:
+                continue
+
+        if not rows:
+            continue
+
+        # 行业内对 fund_ratio 做分位归一 → rs_fund
+        fr = pd.Series([x["fund_ratio"] for x in rows], dtype=float)
+        q = fr.rank(pct=True, method="average")  # 0~1
+        for i, x in enumerate(rows):
+            x["rs_fund"] = float(q.iloc[i])
+
+        # 计算 rs_adj
+        for x in rows:
+            x["rs_adj"] = wp * float(x["rs_price"]) + wv * float(x["rs_volume"]) + wf * float(x["rs_fund"])
+
+        # 行业内按 rs_adj 排序，赋 rank（1..N），严格筛第 3–5 名
+        rows_sorted = sorted(rows, key=lambda d: d["rs_adj"], reverse=True)
+        for rk, x in enumerate(rows_sorted, start=1):
+            x["rank_in_sector"] = rk
+
+        # 应用筛选规则（rank、RS 下限、10D 均额上下限、自适应惩罚、EV/RR/Pwin 软约束）
+        for x in rows_sorted:
+            sym = x["symbol"]; sec = x["sector"]; rnk = int(x["rank_in_sector"])
+            rs_adj = float(x["rs_adj"]); a10 = float(x["amount_10d"])
+            # rank 越界
+            if not (rlo <= rnk <= rhi):
+                rejected.append({"symbol": sym, "sector": sec, "reason_reject": "rank_out_of_range",
+                                 "rank_in_sector": rnk, "rs_adj": rs_adj})
+                continue
+            # rs 下限
+            if rs_adj < rs_min:
+                rejected.append({"symbol": sym, "sector": sec, "reason_reject": "rs_below_min",
+                                 "rs_adj": rs_adj, "rs_min": rs_min})
+                continue
+            # 金额下限
+            if a10 < float(cfg.get("amount_10d_min", 5e8)):
+                rejected.append({"symbol": sym, "sector": sec, "reason_reject": "amount_10d_below_min",
+                                 "amount_10d": a10})
+                continue
+            # 上限与惩罚
+            oversize = False
+            penalty_applied = 1.0
+            if a10 > hard_up:
+                rejected.append({"symbol": sym, "sector": sec, "reason_reject": "amount_10d_above_max",
+                                 "amount_10d": a10, "hard_upper": hard_up})
+                continue
+            elif a10 > soft_up:
+                oversize = True
+                penalty_applied = penalty
+                rs_adj *= penalty
+
+            # 配额
+            if sum(1 for it in selected if it["sector"] == sec) >= per_sector_cap:
+                rejected.append({"symbol": sym, "sector": sec, "reason_reject": "sector_quota_exceeded"})
+                continue
+            if len(selected) >= per_window_cap:
+                rejected.append({"symbol": sym, "sector": sec, "reason_reject": "window_quota_exceeded"})
+                break
+
+            selected.append({
+                "symbol": sym, "sector": sec, "rank_in_sector": rnk,
+                "rs_price": x["rs_price"], "rs_volume": x["rs_volume"], "rs_fund": x["rs_fund"],
+                "rs_adj": rs_adj, "penalty": penalty_applied, "oversize": oversize,
+                "amount_10d": a10, "rr": None, "pwin": None, "ev_bps": None,  # 软约束字段（此步不强行拉）
+            })
+
+    # 5) 快照 + Signal 入库
+    ev_id = 0
+    if emit_event:
+        sector_snapshot = {"scores": sector_scores, "rank_range": [rank_lo, rank_hi]}
+        ev_id = _funnel_emit_snapshot(sector_snapshot, selected, rejected, window)
+
+    with get_session() as s:
+        for it in selected:
+            s.add(Signal(
+                symbol=it["symbol"], side="buy", price_ref=None,
+                state_at_emit=SystemState(state) if state in SystemState.__members__ else None,
+                emotion_gate_passed=None, executable=bool(can_exec and (mode == "normal")),
+                reason_reject=None, window=window,
+                microstructure_checks=json.dumps({
+                    "rs_price": it["rs_price"], "rs_volume": it["rs_volume"], "rs_fund": it["rs_fund"],
+                    "rs_adj": it["rs_adj"], "amount_10d": it["amount_10d"],
+                    "oversize": it.get("oversize", False), "penalty": it.get("penalty", 1.0),
+                    "ctx_event_id": ev_id,
+                }, ensure_ascii=False)
+            ))
+        for it in rejected:
+            s.add(Signal(
+                symbol=it.get("symbol", "?"), side="buy", price_ref=None,
+                state_at_emit=SystemState(state) if state in SystemState.__members__ else None,
+                emotion_gate_passed=None, executable=False,
+                reason_reject=it.get("reason_reject", ""), window=window,
+                microstructure_checks=json.dumps({k: v for k, v in it.items() if k not in ("symbol", "reason_reject")},
+                                                 ensure_ascii=False)
+            ))
+        s.commit()
+
+    return {
+        "selected": selected,
+        "rejected": rejected,
+        "executable": can_exec and (mode == "normal"),
+        "event_id": ev_id,
+        "selected_sectors": selected_sectors,
+    }
+
 
 # ======================
 # 交易日历：AkShare 主来源 + 本地缓存 + 回退
@@ -400,6 +1065,35 @@ def run_trading_task() -> None:
                 "window": now.strftime("%H:%M"),
                 "err": str(e),
             })
+        # ==== 新增结束 ====
+        
+        # ==== 新增：Step5 · 漏斗（选板→选股）====
+        try:
+            # 读取当前系统状态（Step4 产出）；若你在上文已有 decide_state_and_persist，可直接读取返回
+            with get_session() as s:
+                ss = s.exec(select(StateSnapshot).order_by(StateSnapshot.ts.desc())).first()  # 最近一条
+                curr_state = (ss.state.value if ss and hasattr(ss, "state") else "WATCH")
+
+            # 离线/在线：如果上游测试注入了指标，也允许测试脚本通过 env 文件落地到 JSON 注入
+            injected = None  # 在线模式默认无注入；tests 会在离线模式传入
+
+            funnel_payload = select_candidates_funnel(
+                state=curr_state,
+                ks_level=int(ks_payload.get("level", 0)) if isinstance(ks_payload, dict) else 0,
+                window=now.strftime("%H:%M"),
+                indicators_payload=gate_payload.get("indicators") if isinstance(gate_payload, dict) else None,
+                injected=injected,
+                emit_event=True,
+            )
+            _log_event("INFO", "funnel_done", {
+                "window": now.strftime("%H:%M"),
+                "selected_count": len(funnel_payload.get("selected", [])),
+                "executable": funnel_payload.get("executable", False),
+                "state": curr_state,
+                "ks_level": int(ks_payload.get("level", 0)) if isinstance(ks_payload, dict) else 0,
+            })
+        except Exception as e:
+            _log_event("ERROR", "funnel_error", {"window": now.strftime("%H:%M"), "err": str(e)})
         # ==== 新增结束 ====
 
         # ==== 新增：KS（Step3）→ 状态机（Step4）串联 ====

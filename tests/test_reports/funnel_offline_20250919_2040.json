@@ -1,0 +1,105 @@
+{
+  "ts": "2025-09-19T20:40:29.210990+08:00",
+  "selected": [
+    {
+      "symbol": "S5_R5",
+      "sector": "S5",
+      "rank_in_sector": 5,
+      "rs_price": 0.74,
+      "rs_volume": 0.75,
+      "rs_fund": 0.8500000000000001,
+      "rs_adj": 0.7595000000000001,
+      "penalty": 1.0,
+      "oversize": false,
+      "amount_10d": 800000000.0,
+      "rr": 2.1,
+      "pwin": 0.58,
+      "ev_bps": 80.0
+    }
+  ],
+  "rejected": [
+    {
+      "symbol": "S5_R2",
+      "sector": "S5",
+      "reason_reject": "rank_out_of_range",
+      "rank_in_sector": 2,
+      "rs_adj": 0.7025000000000001
+    },
+    {
+      "symbol": "S5_R3",
+      "sector": "S5",
+      "reason_reject": "rs_below_min",
+      "rs_adj": 0.7215000000000001,
+      "rs_min": 0.75
+    },
+    {
+      "symbol": "S5_R4",
+      "sector": "S5",
+      "reason_reject": "rs_below_min",
+      "rs_adj": 0.7404999999999999,
+      "rs_min": 0.75
+    },
+    {
+      "symbol": "S4_R2",
+      "sector": "S4",
+      "reason_reject": "rank_out_of_range",
+      "rank_in_sector": 2,
+      "rs_adj": 0.6915
+    },
+    {
+      "symbol": "S4_R3",
+      "sector": "S4",
+      "reason_reject": "rs_below_min",
+      "rs_adj": 0.7105,
+      "rs_min": 0.75
+    },
+    {
+      "symbol": "S4_R4",
+      "sector": "S4",
+      "reason_reject": "rs_below_min",
+      "rs_adj": 0.7295,
+      "rs_min": 0.75
+    },
+    {
+      "symbol": "S4_R5",
+      "sector": "S4",
+      "reason_reject": "rs_below_min",
+      "rs_adj": 0.7484999999999999,
+      "rs_min": 0.75
+    },
+    {
+      "symbol": "S3_R2",
+      "sector": "S3",
+      "reason_reject": "rank_out_of_range",
+      "rank_in_sector": 2,
+      "rs_adj": 0.6805000000000001
+    },
+    {
+      "symbol": "S3_R3",
+      "sector": "S3",
+      "reason_reject": "rs_below_min",
+      "rs_adj": 0.6995000000000001,
+      "rs_min": 0.75
+    },
+    {
+      "symbol": "S3_R4",
+      "sector": "S3",
+      "reason_reject": "rs_below_min",
+      "rs_adj": 0.7184999999999999,
+      "rs_min": 0.75
+    },
+    {
+      "symbol": "S3_R5",
+      "sector": "S3",
+      "reason_reject": "rs_below_min",
+      "rs_adj": 0.7375,
+      "rs_min": 0.75
+    }
+  ],
+  "selected_sectors": [
+    "S5",
+    "S3",
+    "S4"
+  ],
+  "event_id": 73
+}
